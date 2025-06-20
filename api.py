@@ -13,7 +13,7 @@ from typing import List, Optional, Dict, Any
 
 import bcrypt
 import numpy as np
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Query
 from neo4j import GraphDatabase, Driver, Session
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
@@ -91,6 +91,9 @@ class AutorResponse(AutorBase):
     id: str = Field(..., example="george_orwell")
     livros: List[str] = Field([], example=["1984", "A Revolução dos Bichos"])
 
+class AutorSearchResponse(BaseModel):
+    resultados: List[AutorResponse]
+
 # Schemas de Livro
 class LivroBase(BaseModel):
     titulo: str = Field(..., example="1984")
@@ -114,6 +117,9 @@ class LivroResponse(LivroBase):
     autor: Optional[str] = Field(None, example="George Orwell")
     categorias: List[str] = Field(default_factory=list)
     descr_embedding: Optional[List[float]] = None
+
+class LivroSearchResponse(BaseModel):
+    resultados: List[LivroResponse]
 
 # Schemas de Usuário
 class UsuarioBase(BaseModel):
@@ -193,6 +199,11 @@ def crud_ler_autor(session: Session, autor_id: str) -> Optional[Dict[str, Any]]:
     record = result.single()
     return record.data() if record and record['id'] else None
 
+def crud_buscar_autores_por_nome(session: Session, nome: str) -> List[Dict[str, Any]]:
+    query = "MATCH (a:Autor) WHERE toLower(a.nome) CONTAINS toLower($nome) OPTIONAL MATCH (a)-[:ESCREVEU]->(l:Livro) RETURN a.id AS id, a.nome AS nome, collect(l.titulo) AS livros"
+    result = session.run(query, nome=nome)
+    return [record.data() for record in result]
+
 def crud_atualizar_autor(session: Session, autor_id: str, autor_update: AutorUpdate) -> Optional[Dict[str, Any]]:
     update_data = autor_update.dict(exclude_unset=True)
     if not update_data: return crud_ler_autor(session, autor_id)
@@ -248,6 +259,17 @@ def crud_ler_livro(session: Session, livro_id: int) -> Optional[Dict[str, Any]]:
     """
     result = session.run(query, id=livro_id)
     return result.single().data() if result.peek() else None
+
+def crud_buscar_livros_por_titulo(session: Session, titulo: str) -> List[Dict[str, Any]]:
+    query = """
+    MATCH (l:Livro) WHERE toLower(l.titulo) CONTAINS toLower($titulo) AND l.descricao <> "None"
+    OPTIONAL MATCH (a:Autor)-[:ESCREVEU]->(l)
+    OPTIONAL MATCH (l)-[:PERTENCE_A]->(c:Categoria)
+    RETURN l.id as id, l.titulo AS titulo, l.ano_publicacao as ano_publicacao, l.url_img as url_img, l.descricao as descricao,
+           l.descr_embedding as descr_embedding, a.nome as autor, collect(c.nome) as categorias
+    """
+    result = session.run(query, titulo=titulo)
+    return [record.data() for record in result]
 
 def crud_atualizar_livro(session: Session, livro_id: int, livro_update: LivroUpdate, model: SentenceTransformer) -> bool:
     update_data = livro_update.dict(exclude_unset=True)
@@ -425,37 +447,12 @@ def crud_gerar_recomendacoes(session: Session, user_id: str) -> List[Dict[str, A
 # --- 5. ENDPOINTS DA API (Rotas) ---
 app = FastAPI(title="API da Biblioteca", description="Um microsserviço para gerenciar livros, usuários e suas interações.", version="1.0.0", lifespan=lifespan)
 
-# --- Rotas de Livro ---
-@app.post("/livros/", response_model=LivroResponse, status_code=status.HTTP_201_CREATED, tags=["Livros"])
-def criar_livro_endpoint(livro: LivroCreate, session: Session = Depends(get_db_session), model: SentenceTransformer = Depends(get_embedding_model)):
-    db_livro_info = crud_criar_livro(session, livro, model)
-    if not db_livro_info: raise HTTPException(status_code=500, detail="Não foi possível criar o livro.")
-    return crud_ler_livro(session, db_livro_info['id'])
+# --- Rotas de Autor ---
+@app.get("/autores/buscar", response_model=AutorSearchResponse, tags=["Autores"])
+def buscar_autores_endpoint(q: str = Query(..., min_length=3), session: Session = Depends(get_db_session)):
+    autores = crud_buscar_autores_por_nome(session, q)
+    return {"resultados": autores}
 
-@app.get("/livros/{livro_id}", response_model=LivroResponse, tags=["Livros"])
-def ler_livro_endpoint(livro_id: int, session: Session = Depends(get_db_session)):
-    db_livro = crud_ler_livro(session, livro_id)
-    if not db_livro: 
-        raise HTTPException(status_code=404, detail="Livro não encontrado")
-    
-    # Verifica se a descrição é a string "None"
-    if db_livro.get('descricao') == "None":
-        raise HTTPException(status_code=404, detail="Livro não encontrado ou não disponível.")
-        
-    return db_livro
-
-@app.put("/livros/{livro_id}", response_model=LivroResponse, tags=["Livros"])
-def atualizar_livro_endpoint(livro_id: int, livro: LivroUpdate, session: Session = Depends(get_db_session), model: SentenceTransformer = Depends(get_embedding_model)):
-    if not crud_atualizar_livro(session, livro_id, livro, model):
-        raise HTTPException(status_code=404, detail="Livro não encontrado ou nenhuma propriedade foi alterada")
-    return crud_ler_livro(session, livro_id)
-
-@app.delete("/livros/{livro_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Livros"])
-def apagar_livro_endpoint(livro_id: int, session: Session = Depends(get_db_session)):
-    if not crud_apagar_livro(session, livro_id):
-        raise HTTPException(status_code=404, detail="Livro não encontrado")
-
-# (Restante dos endpoints permanece o mesmo)
 @app.post("/autores/", response_model=AutorResponse, status_code=status.HTTP_201_CREATED, tags=["Autores"])
 def criar_autor_endpoint(autor: AutorCreate, session: Session = Depends(get_db_session)):
     db_autor = crud_criar_autor(session, autor)
@@ -479,6 +476,39 @@ def apagar_autor_endpoint(autor_id: str, session: Session = Depends(get_db_sessi
         raise HTTPException(status_code=404, detail="Autor não encontrado")
     return None
 
+# --- Rotas de Livro ---
+@app.get("/livros/buscar", response_model=LivroSearchResponse, tags=["Livros"])
+def buscar_livros_endpoint(q: str = Query(..., min_length=3), session: Session = Depends(get_db_session)):
+    livros = crud_buscar_livros_por_titulo(session, q)
+    return {"resultados": livros}
+    
+@app.post("/livros/", response_model=LivroResponse, status_code=status.HTTP_201_CREATED, tags=["Livros"])
+def criar_livro_endpoint(livro: LivroCreate, session: Session = Depends(get_db_session), model: SentenceTransformer = Depends(get_embedding_model)):
+    db_livro_info = crud_criar_livro(session, livro, model)
+    if not db_livro_info: raise HTTPException(status_code=500, detail="Não foi possível criar o livro.")
+    return crud_ler_livro(session, db_livro_info['id'])
+
+@app.get("/livros/{livro_id}", response_model=LivroResponse, tags=["Livros"])
+def ler_livro_endpoint(livro_id: int, session: Session = Depends(get_db_session)):
+    db_livro = crud_ler_livro(session, livro_id)
+    if not db_livro: 
+        raise HTTPException(status_code=404, detail="Livro não encontrado")
+    if db_livro.get('descricao') == "None":
+        raise HTTPException(status_code=404, detail="Livro não encontrado ou não disponível.")
+    return db_livro
+
+@app.put("/livros/{livro_id}", response_model=LivroResponse, tags=["Livros"])
+def atualizar_livro_endpoint(livro_id: int, livro: LivroUpdate, session: Session = Depends(get_db_session), model: SentenceTransformer = Depends(get_embedding_model)):
+    if not crud_atualizar_livro(session, livro_id, livro, model):
+        raise HTTPException(status_code=404, detail="Livro não encontrado ou nenhuma propriedade foi alterada")
+    return crud_ler_livro(session, livro_id)
+
+@app.delete("/livros/{livro_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Livros"])
+def apagar_livro_endpoint(livro_id: int, session: Session = Depends(get_db_session)):
+    if not crud_apagar_livro(session, livro_id):
+        raise HTTPException(status_code=404, detail="Livro não encontrado")
+
+# (Restante dos endpoints permanece o mesmo)
 @app.post("/usuarios/", response_model=UsuarioResponse, status_code=status.HTTP_201_CREATED, tags=["Usuários"])
 def criar_usuario_endpoint(usuario: UsuarioCreate, session: Session = Depends(get_db_session)):
     return crud_criar_usuario(session, usuario)
