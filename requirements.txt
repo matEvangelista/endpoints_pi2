@@ -1,0 +1,8 @@
+re
+typing
+bcrypt
+numpy
+fastapi
+neo4j
+pydantic
+sentence_transformers
