@@ -194,13 +194,13 @@ def crud_criar_autor(session: Session, autor: AutorCreate) -> Optional[Dict[str,
     return result.single().data()
 
 def crud_ler_autor(session: Session, autor_id: str) -> Optional[Dict[str, Any]]:
-    query = "MATCH (a:Autor {id: $id}) OPTIONAL MATCH (a)-[:ESCREVEU]->(l:Livro) RETURN a.id AS id, a.nome AS nome, collect(l.titulo) AS livros"
+    query = "MATCH (a:Autor {id: $id}) OPTIONAL MATCH (a)-[:ESCREVEU]->(l:Livro) RETURN a.id AS id, coalesce(a.nome, '') AS nome, collect(l.titulo) AS livros"
     result = session.run(query, id=autor_id)
     record = result.single()
     return record.data() if record and record['id'] else None
 
 def crud_buscar_autores_por_nome(session: Session, nome: str) -> List[Dict[str, Any]]:
-    query = "MATCH (a:Autor) WHERE toLower(a.nome) CONTAINS toLower($nome) OPTIONAL MATCH (a)-[:ESCREVEU]->(l:Livro) RETURN a.id AS id, a.nome AS nome, collect(l.titulo) AS livros"
+    query = "MATCH (a:Autor) WHERE toLower(a.nome) CONTAINS toLower($nome) OPTIONAL MATCH (a)-[:ESCREVEU]->(l:Livro) RETURN a.id AS id, coalesce(a.nome, '') AS nome, collect(l.titulo) AS livros"
     result = session.run(query, nome=nome)
     return [record.data() for record in result]
 
@@ -219,7 +219,6 @@ def crud_apagar_autor(session: Session, autor_id: str) -> bool:
 def crud_criar_livro(session: Session, livro: LivroCreate, model: SentenceTransformer) -> Optional[Dict[str, Any]]:
     autor_id = re.sub(r'[^a-z0-9_]', '', re.sub(r'\s+', '_', livro.autor_nome.lower()))
     
-    # Converte a string "None" ou um valor nulo para uma string vazia
     descricao_limpa = livro.descricao if livro.descricao and livro.descricao != "None" else ""
     embedding = model.encode(descricao_limpa).tolist() if descricao_limpa else []
     
@@ -243,9 +242,16 @@ def crud_criar_livro(session: Session, livro: LivroCreate, model: SentenceTransf
         MERGE (l)-[:PERTENCE_A]->(c)
         RETURN l.id as id
         """
-    params = livro.dict()
-    params['descricao'] = descricao_limpa # Usa a descrição limpa
-    params.update({"autor_id": autor_id, "autor_nome": livro.autor_nome, "embedding": embedding})
+    params = {
+        "titulo": livro.titulo,
+        "ano_publicacao": livro.ano_publicacao,
+        "url_img": livro.url_img,
+        "descricao": descricao_limpa,
+        "embedding": embedding,
+        "autor_id": autor_id,
+        "autor_nome": livro.autor_nome,
+        "categorias": livro.categorias
+    }
     result = session.run(query, params)
     return result.single()
 
@@ -254,28 +260,54 @@ def crud_ler_livro(session: Session, livro_id: int) -> Optional[Dict[str, Any]]:
     MATCH (l:Livro {id: $id})
     OPTIONAL MATCH (a:Autor)-[:ESCREVEU]->(l)
     OPTIONAL MATCH (l)-[:PERTENCE_A]->(c:Categoria)
-    RETURN l.id as id, l.titulo AS titulo, l.ano_publicacao as ano_publicacao, l.url_img as url_img, l.descricao as descricao,
-           l.descr_embedding as descr_embedding, a.nome as autor, collect(c.nome) as categorias
+    RETURN l.id as id, 
+           coalesce(l.titulo, "") AS titulo, 
+           l.ano_publicacao as ano_publicacao, 
+           coalesce(l.url_img, "") as url_img, 
+           coalesce(l.descricao, "") as descricao,
+           l.descr_embedding as descr_embedding, 
+           coalesce(a.nome, "Desconhecido") as autor, 
+           collect(c.nome) as categorias
     """
     result = session.run(query, id=livro_id)
-    return result.single().data() if result.peek() else None
+    record = result.single()
+    if not record:
+        return None
+    
+    data = record.data()
+    # Sanitize data to prevent validation errors with NaN values
+    if not isinstance(data.get('url_img'), str):
+        data['url_img'] = ""
+    return data
 
 def crud_buscar_livros_por_titulo(session: Session, titulo: str) -> List[Dict[str, Any]]:
     query = """
     MATCH (l:Livro) WHERE toLower(l.titulo) CONTAINS toLower($titulo) AND l.descricao <> "None"
     OPTIONAL MATCH (a:Autor)-[:ESCREVEU]->(l)
     OPTIONAL MATCH (l)-[:PERTENCE_A]->(c:Categoria)
-    RETURN l.id as id, l.titulo AS titulo, l.ano_publicacao as ano_publicacao, l.url_img as url_img, l.descricao as descricao,
-           l.descr_embedding as descr_embedding, a.nome as autor, collect(c.nome) as categorias
+    RETURN l.id as id, 
+           coalesce(l.titulo, "") AS titulo, 
+           l.ano_publicacao as ano_publicacao, 
+           coalesce(l.url_img, "") as url_img, 
+           coalesce(l.descricao, "") as descricao,
+           l.descr_embedding as descr_embedding, 
+           coalesce(a.nome, "Desconhecido") as autor, 
+           collect(c.nome) as categorias
     """
     result = session.run(query, titulo=titulo)
-    return [record.data() for record in result]
+    livros = []
+    for record in result:
+        data = record.data()
+        # Sanitize data to prevent validation errors with NaN values
+        if not isinstance(data.get('url_img'), str):
+            data['url_img'] = ""
+        livros.append(data)
+    return livros
 
 def crud_atualizar_livro(session: Session, livro_id: int, livro_update: LivroUpdate, model: SentenceTransformer) -> bool:
     update_data = livro_update.dict(exclude_unset=True)
     novas_categorias = update_data.pop('categorias', None)
     
-    # Limpa a descrição se for "None" e recalcula o embedding
     if 'descricao' in update_data:
         descricao_atualizada = update_data['descricao']
         if not descricao_atualizada or descricao_atualizada == "None":
@@ -344,7 +376,8 @@ def crud_ler_colecao(session: Session, colecao_id: str) -> Optional[Dict[str, An
     query = """
     MATCH (c:Colecao {id: $id})<-[:CRIOU]-(u:Usuario)
     OPTIONAL MATCH (c)-[:CONTEM]->(l:Livro)
-    RETURN c.id as id, c.nome as nome, u.id as user_id, collect({id: l.id, titulo: l.titulo}) as livros
+    WITH c, u, CASE WHEN l IS NULL THEN [] ELSE collect({id: l.id, titulo: coalesce(l.titulo, "Título Desconhecido")}) END as livros
+    RETURN c.id as id, c.nome as nome, u.id as user_id, livros
     """
     result = session.run(query, id=colecao_id)
     return result.single().data() if result.peek() else None
