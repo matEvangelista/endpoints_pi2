@@ -340,6 +340,30 @@ def crud_apagar_livro(session: Session, livro_id: int) -> bool:
     result = session.run("MATCH (l:Livro {id: $id}) DETACH DELETE l", id=livro_id)
     return result.consume().counters.nodes_deleted > 0
 
+def crud_buscar_todos_livros(session: Session) -> List[Dict[str, Any]]:
+    query = """
+    MATCH (l:Livro)
+    OPTIONAL MATCH (a:Autor)-[:ESCREVEU]->(l)
+    OPTIONAL MATCH (l)-[:PERTENCE_A]->(c:Categoria)
+    RETURN l.id as id, 
+           coalesce(l.titulo, "") AS titulo, 
+           l.ano_publicacao as ano_publicacao, 
+           coalesce(l.url_img, "") as url_img, 
+           coalesce(l.descricao, "") as descricao,
+           l.descr_embedding as descr_embedding, 
+           coalesce(a.nome, "Desconhecido") as autor, 
+           collect(c.nome) as categorias
+    """
+    result = session.run(query)
+    livros = []
+    for record in result:
+        data = record.data()
+        # Sanitize data to prevent validation errors with NaN values
+        if not isinstance(data.get('url_img'), str):
+            data['url_img'] = ""
+        livros.append(data)
+    return livros
+
 # --- CRUD de Usuário ---
 def crud_criar_usuario(session: Session, usuario: UsuarioCreate) -> Dict[str, Any]:
     user_id = re.sub(r'[^a-z0-9_]', '', f"{usuario.nome.lower()}_{usuario.sobrenome.lower()}")
@@ -573,6 +597,11 @@ def atualizar_livro_endpoint(livro_id: int, livro: LivroUpdate, session: Session
 def apagar_livro_endpoint(livro_id: int, session: Session = Depends(get_db_session)):
     if not crud_apagar_livro(session, livro_id):
         raise HTTPException(status_code=404, detail="Livro não encontrado")
+
+@app.get("/livros/todos/", response_model=List[LivroResponse], tags=["Livros"])
+def buscar_todos_livros_endpoint(session: Session = Depends(get_db_session)):
+    livros = crud_buscar_todos_livros(session)
+    return livros
 
 # (Restante dos endpoints permanece o mesmo)
 @app.post("/usuarios/", response_model=UsuarioResponse, status_code=status.HTTP_201_CREATED, tags=["Usuários"])
