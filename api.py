@@ -14,6 +14,7 @@ from typing import List, Optional, Dict, Any
 import bcrypt
 import numpy as np
 from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi.middleware.cors import CORSMiddleware
 from neo4j import GraphDatabase, Driver, Session
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
@@ -479,6 +480,38 @@ def crud_gerar_recomendacoes(session: Session, user_id: str) -> List[Dict[str, A
 
 # --- 5. ENDPOINTS DA API (Rotas) ---
 app = FastAPI(title="API da Biblioteca", description="Um microsserviço para gerenciar livros, usuários e suas interações.", version="1.0.0", lifespan=lifespan)
+
+# Configure CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+@app.get("/health", tags=["Health"])
+def health_check():
+    """Endpoint para verificar o status dos serviços."""
+    status = {
+        "status": "ok",
+        "services": {
+            "neo4j": "available" if db_driver is not None else "unavailable",
+            "embedding_model": "available" if embedding_model is not None else "unavailable"
+        }
+    }
+    
+    if db_driver is None and embedding_model is None:
+        status["status"] = "degraded"
+        status["message"] = "Nenhum serviço crítico está disponível"
+    elif db_driver is None:
+        status["status"] = "degraded"
+        status["message"] = "Neo4j não está disponível"
+    elif embedding_model is None:
+        status["status"] = "degraded"
+        status["message"] = "Modelo de embedding não está disponível"
+    
+    return status
 
 # --- Rotas de Autor ---
 @app.get("/autores/buscar", response_model=AutorSearchResponse, tags=["Autores"])
