@@ -18,11 +18,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from neo4j import GraphDatabase, Driver, Session
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
+import jwt as pyjwt
+from datetime import datetime, timedelta
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 # --- 2. CONFIGURAÇÃO DO BANCO DE DADOS E MODELO DE ML ---
-
 NEO4J_URI = "neo4j://localhost:7687"
-NEO4J_AUTH = ("neo4j", "neo4j") # Senha que você forneceu
+NEO4J_AUTH = ("neo4j", "senha123456789") # Senha que você forneceu
+
+SECRET_KEY = "your-secret-key-here-change-this-in-production"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+security = HTTPBearer()
 
 # Objetos que armazenarão o driver e o modelo
 db_driver: Optional[Driver] = None
@@ -124,21 +132,21 @@ class LivroSearchResponse(BaseModel):
 
 # Schemas de Usuário
 class UsuarioBase(BaseModel):
-    nome: str = Field(..., example="Mateus")
-    sobrenome: str = Field(..., example="Evangelista")
-    email: str = Field(..., example="mateus.e@exemplo.com")
+    name: str = Field(..., example="Maria")
+    surname: str = Field(..., example="Silva")
+    email: str = Field(..., example="usuario@email.com")
 
 class UsuarioCreate(UsuarioBase):
-    senha: str = Field(..., example="senhaSuperForte123")
+    password: str = Field(..., example="senhaSuperForte123")
 
 class UsuarioUpdate(BaseModel):
-    nome: Optional[str] = None
-    sobrenome: Optional[str] = None
+    name: Optional[str] = None
+    surname: Optional[str] = None
     email: Optional[str] = None
-    senha: Optional[str] = None
+    password: Optional[str] = None
 
 class UsuarioResponse(UsuarioBase):
-    id: str = Field(..., example="mateus_evangelista")
+    user_id: int = Field(..., example=1)
 
 # Schemas de Coleção
 class ColecaoCreate(BaseModel):
@@ -173,6 +181,16 @@ class Recomendacao(BaseModel):
 
 class RecomendacoesResponse(BaseModel):
     recomendacoes: List[Recomendacao]
+
+# Schemas de autenticação
+class LoginRequest(BaseModel):
+    email: str = Field(..., example="email@exemplo.com")
+    senha: str = Field(..., example="senhaSuperForte123")
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user_id: str
 
 
 # --- 4. FUNÇÕES CRUD (Lógica de Banco de Dados) ---
@@ -366,28 +384,34 @@ def crud_buscar_todos_livros(session: Session) -> List[Dict[str, Any]]:
 
 # --- CRUD de Usuário ---
 def crud_criar_usuario(session: Session, usuario: UsuarioCreate) -> Dict[str, Any]:
-    user_id = re.sub(r'[^a-z0-9_]', '', f"{usuario.nome.lower()}_{usuario.sobrenome.lower()}")
-    senha_hash = bcrypt.hashpw(usuario.senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    query = "MERGE (u:Usuario {id: $id}) ON CREATE SET u.nome = $nome, u.sobrenome = $sobrenome, u.email = $email, u.senha_hash = $senha_hash RETURN u.id as id, u.nome as nome, u.sobrenome as sobrenome, u.email as email"
-    params = usuario.dict(); params.update({"id": user_id, "senha_hash": senha_hash})
+    # Busca o maior user_id atual e incrementa
+    result = session.run("OPTIONAL MATCH (u:Usuario) RETURN coalesce(max(u.user_id), 0) AS max_id")
+    max_id = result.single()["max_id"]
+    user_id = max_id + 1
+    senha_hash = bcrypt.hashpw(usuario.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    query = """
+        CREATE (u:Usuario {user_id: $user_id, name: $name, surname: $surname, email: $email, password: $senha_hash})
+        RETURN u.user_id as user_id, u.name as name, u.surname as surname, u.email as email
+    """
+    params = {"user_id": user_id, "name": usuario.name, "surname": usuario.surname, "email": usuario.email, "senha_hash": senha_hash}
     result = session.run(query, params)
     return result.single().data()
 
-def crud_ler_usuario(session: Session, user_id: str) -> Optional[Dict[str, Any]]:
-    result = session.run("MATCH (u:Usuario {id: $id}) RETURN u.id as id, u.nome as nome, u.sobrenome as sobrenome, u.email as email", id=user_id)
+def crud_ler_usuario(session: Session, user_id: int) -> Optional[Dict[str, Any]]:
+    result = session.run("MATCH (u:Usuario {user_id: $user_id}) RETURN u.user_id as user_id, u.name as name, u.surname as surname, u.email as email", user_id=user_id)
     return result.single().data() if result.peek() else None
 
-def crud_atualizar_usuario(session: Session, user_id: str, usuario_update: UsuarioUpdate) -> Optional[Dict[str, Any]]:
+def crud_atualizar_usuario(session: Session, user_id: int, usuario_update: UsuarioUpdate) -> Optional[Dict[str, Any]]:
     update_data = usuario_update.dict(exclude_unset=True)
     if not update_data: return crud_ler_usuario(session, user_id)
-    if "senha" in update_data:
-        update_data["senha_hash"] = bcrypt.hashpw(update_data.pop("senha").encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    query = "MATCH (u:Usuario {id: $id}) SET u += $updates RETURN u.id as id, u.nome as nome, u.sobrenome as sobrenome, u.email as email"
-    result = session.run(query, id=user_id, updates=update_data)
+    if "password" in update_data:
+        update_data["password"] = bcrypt.hashpw(update_data.pop("password").encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    query = "MATCH (u:Usuario {user_id: $user_id}) SET u += $updates RETURN u.user_id as user_id, u.name as name, u.surname as surname, u.email as email"
+    result = session.run(query, user_id=user_id, updates=update_data)
     return result.single().data() if result.peek() else None
 
-def crud_apagar_usuario(session: Session, user_id: str) -> bool:
-    result = session.run("MATCH (u:Usuario {id: $id}) DETACH DELETE u", id=user_id)
+def crud_apagar_usuario(session: Session, user_id: int) -> bool:
+    result = session.run("MATCH (u:Usuario {user_id: $user_id}) DETACH DELETE u", user_id=user_id)
     return result.consume().counters.nodes_deleted > 0
 
 # --- CRUD de Coleção ---
@@ -501,6 +525,52 @@ def crud_gerar_recomendacoes(session: Session, user_id: str) -> List[Dict[str, A
     final_list = sorted(final_recs_dict.values(), key=lambda x: x['similaridade'], reverse=True)
     return final_list
 
+# Autenticaão
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = pyjwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+def authenticate_user(session: Session, email: str, password: str) -> Optional[Dict[str, Any]]:
+    # Find user by email
+    result = session.run(
+        "MATCH (u:Usuario {email: $email}) RETURN u.user_id as user_id, u.name as name, u.surname as surname, u.email as email, u.password as password",
+        email=email
+    )
+    record = result.single()
+    
+    if not record:
+        return None
+    
+    user_data = record.data()
+    if not verify_password(password, user_data['password']):
+        return None
+    
+    return user_data
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), session: Session = Depends(get_db_session)) -> Dict[str, Any]:
+    try:
+        payload = pyjwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except pyjwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    user = crud_ler_usuario(session, int(user_id))
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    return user
+
 
 # --- 5. ENDPOINTS DA API (Rotas) ---
 app = FastAPI(title="API da Biblioteca", description="Um microsserviço para gerenciar livros, usuários e suas interações.", version="1.0.0", lifespan=lifespan)
@@ -603,25 +673,25 @@ def buscar_todos_livros_endpoint(session: Session = Depends(get_db_session)):
     livros = crud_buscar_todos_livros(session)
     return livros
 
-# (Restante dos endpoints permanece o mesmo)
+# --- Rotas de Usuário ---
 @app.post("/usuarios/", response_model=UsuarioResponse, status_code=status.HTTP_201_CREATED, tags=["Usuários"])
 def criar_usuario_endpoint(usuario: UsuarioCreate, session: Session = Depends(get_db_session)):
     return crud_criar_usuario(session, usuario)
 
 @app.get("/usuarios/{user_id}", response_model=UsuarioResponse, tags=["Usuários"])
-def ler_usuario_endpoint(user_id: str, session: Session = Depends(get_db_session)):
+def ler_usuario_endpoint(user_id: int, session: Session = Depends(get_db_session)):
     db_user = crud_ler_usuario(session, user_id)
     if not db_user: raise HTTPException(status_code=404, detail="Usuário não encontrado")
     return db_user
 
 @app.put("/usuarios/{user_id}", response_model=UsuarioResponse, tags=["Usuários"])
-def atualizar_usuario_endpoint(user_id: str, usuario: UsuarioUpdate, session: Session = Depends(get_db_session)):
+def atualizar_usuario_endpoint(user_id: int, usuario: UsuarioUpdate, session: Session = Depends(get_db_session)):
     db_user = crud_atualizar_usuario(session, user_id, usuario)
     if not db_user: raise HTTPException(status_code=404, detail="Usuário não encontrado")
     return db_user
 
 @app.delete("/usuarios/{user_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Usuários"])
-def apagar_usuario_endpoint(user_id: str, session: Session = Depends(get_db_session)):
+def apagar_usuario_endpoint(user_id: int, session: Session = Depends(get_db_session)):
     if not crud_apagar_usuario(session, user_id):
         raise HTTPException(status_code=404, detail="Usuário não encontrado")
 
@@ -689,3 +759,40 @@ def apagar_avaliacao_endpoint(user_id: str, livro_id: int, session: Session = De
 def gerar_recomendacoes_endpoint(user_id: str, session: Session = Depends(get_db_session)):
     recomendacoes = crud_gerar_recomendacoes(session, user_id)
     return {"recomendacoes": recomendacoes}
+
+
+@app.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED, tags=["Authentication"])
+def registar_usuario_endpoint(usuario: UsuarioCreate, session: Session = Depends(get_db_session)):
+    # Verifica se o usuário já existe
+    result = session.run("MATCH (u:Usuario {email: $email}) RETURN u.user_id", email=usuario.email)
+    if result.single():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Registra o usuário
+    user_data = crud_criar_usuario(session, usuario)
+    
+    # Cria um token de acesso para o usuário
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(user_data["user_id"])}, expires_delta=access_token_expires
+    )
+    user_id = str(user_data["user_id"])
+    
+    return TokenResponse(access_token=str(access_token), user_id=user_id)
+
+@app.post("/auth/login", response_model=TokenResponse, tags=["Authentication"])
+def login_endpoint(login_data: LoginRequest, session: Session = Depends(get_db_session)):
+    user = authenticate_user(session, login_data.email, login_data.senha)
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["user_id"]}, expires_delta=access_token_expires
+    )
+    
+    return TokenResponse(access_token=access_token, user_id=str(user["user_id"]))
+
+@app.get("/auth/me", response_model=UsuarioResponse, tags=["Authentication"])
+def get_current_user_endpoint(current_user: Dict[str, Any] = Depends(get_current_user)):
+    return current_user

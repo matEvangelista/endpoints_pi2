@@ -5,3 +5,4 @@ fastapi
 neo4j
 pydantic
 sentence_transformers
+PyJWT==2.8.0
