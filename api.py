@@ -13,7 +13,7 @@ from typing import List, Optional, Dict, Any
 
 import bcrypt
 import numpy as np
-from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from neo4j import GraphDatabase, Driver, Session
 from pydantic import BaseModel, Field
@@ -21,6 +21,9 @@ from sentence_transformers import SentenceTransformer
 import jwt as pyjwt
 from datetime import datetime, timedelta
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
+import os
+from fastapi.staticfiles import StaticFiles
 
 # --- 2. CONFIGURAÇÃO DO BANCO DE DADOS E MODELO DE ML ---
 NEO4J_URI = "neo4j://localhost:7687"
@@ -35,6 +38,9 @@ security = HTTPBearer()
 # Objetos que armazenarão o driver e o modelo
 db_driver: Optional[Driver] = None
 embedding_model: Optional[SentenceTransformer] = None
+
+UPLOAD_DIR = "uploaded_images"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 def get_db_session() -> Session:
     """
@@ -525,6 +531,37 @@ def crud_gerar_recomendacoes(session: Session, user_id: str) -> List[Dict[str, A
     final_list = sorted(final_recs_dict.values(), key=lambda x: x['similaridade'], reverse=True)
     return final_list
 
+def crud_associar_livro_usuario(session: Session, user_id: int, livro_id: int) -> bool:
+    query = """
+        MATCH (u:Usuario {user_id: $user_id}), (l:Livro {id: $livro_id})
+        MERGE (u)-[:REGISTROU]->(l)
+    """
+    result = session.run(query, user_id=user_id, livro_id=livro_id)
+    return result.consume().counters.relationships_created > 0
+
+def crud_livros_registrados_por_usuario(session: Session, user_id: int) -> List[Dict[str, Any]]:
+    query = '''
+    MATCH (u:Usuario {user_id: $user_id})-[:REGISTROU]->(l:Livro)
+    OPTIONAL MATCH (a:Autor)-[:ESCREVEU]->(l)
+    OPTIONAL MATCH (l)-[:PERTENCE_A]->(c:Categoria)
+    RETURN l.id as id,
+           coalesce(l.titulo, "") AS titulo,
+           l.ano_publicacao as ano_publicacao,
+           coalesce(l.url_img, "") as url_img,
+           coalesce(l.descricao, "") as descricao,
+           l.descr_embedding as descr_embedding,
+           coalesce(a.nome, "Desconhecido") as autor,
+           collect(c.nome) as categorias
+    '''
+    result = session.run(query, user_id=user_id)
+    livros = []
+    for record in result:
+        data = record.data()
+        if not isinstance(data.get('url_img'), str):
+            data['url_img'] = ""
+        livros.append(data)
+    return livros
+
 # Autenticaão
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
@@ -642,11 +679,15 @@ def buscar_livros_endpoint(q: str = Query(..., min_length=3), session: Session =
     livros = crud_buscar_livros_por_titulo(session, q)
     return {"resultados": livros}
     
-@app.post("/livros/", response_model=LivroResponse, status_code=status.HTTP_201_CREATED, tags=["Livros"])
-def criar_livro_endpoint(livro: LivroCreate, session: Session = Depends(get_db_session), model: SentenceTransformer = Depends(get_embedding_model)):
+@app.post("/usuarios/{user_id}/livros/", response_model=LivroResponse, status_code=status.HTTP_201_CREATED, tags=["Livros"])
+def criar_livro_endpoint(user_id: int, livro: LivroCreate, session: Session = Depends(get_db_session), model: SentenceTransformer = Depends(get_embedding_model)):
     db_livro_info = crud_criar_livro(session, livro, model)
-    if not db_livro_info: raise HTTPException(status_code=500, detail="Não foi possível criar o livro.")
-    return crud_ler_livro(session, db_livro_info['id'])
+    if not db_livro_info:
+        raise HTTPException(status_code=500, detail="Não foi possível criar o livro.")
+    livro_id = db_livro_info['id']
+    if not crud_associar_livro_usuario(session, user_id, livro_id):
+        raise HTTPException(status_code=404, detail="Usuário não encontrado para associar o livro.")
+    return crud_ler_livro(session, livro_id)
 
 @app.get("/livros/{livro_id}", response_model=LivroResponse, tags=["Livros"])
 def ler_livro_endpoint(livro_id: int, session: Session = Depends(get_db_session)):
@@ -760,6 +801,10 @@ def gerar_recomendacoes_endpoint(user_id: str, session: Session = Depends(get_db
     recomendacoes = crud_gerar_recomendacoes(session, user_id)
     return {"recomendacoes": recomendacoes}
 
+@app.get("/usuarios/{user_id}/livros/registrados", response_model=List[LivroResponse], tags=["Livros"])
+def listar_livros_registrados_endpoint(user_id: int, session: Session = Depends(get_db_session)):
+    livros = crud_livros_registrados_por_usuario(session, user_id)
+    return livros
 
 @app.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED, tags=["Authentication"])
 def registar_usuario_endpoint(usuario: UsuarioCreate, session: Session = Depends(get_db_session)):
@@ -796,3 +841,21 @@ def login_endpoint(login_data: LoginRequest, session: Session = Depends(get_db_s
 @app.get("/auth/me", response_model=UsuarioResponse, tags=["Authentication"])
 def get_current_user_endpoint(current_user: Dict[str, Any] = Depends(get_current_user)):
     return current_user
+
+@app.post("/upload/imagem_livro/", tags=["Livros"])
+def upload_imagem_livro(file: UploadFile = File(...)):
+    """
+    Recebe um arquivo de imagem, salva em disco e retorna a URL pública.
+    """
+    extensao = os.path.splitext(file.filename)[1]
+    if extensao.lower() not in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
+        return JSONResponse(status_code=400, content={"erro": "Formato de imagem não suportado."})
+    nome_arquivo = f"livro_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}{extensao}"
+    caminho_arquivo = os.path.join(UPLOAD_DIR, nome_arquivo)
+    with open(caminho_arquivo, "wb") as buffer:
+        buffer.write(file.file.read())
+    url_publica = f"/static/{nome_arquivo}"
+    return {"url_img": url_publica}
+
+from fastapi.staticfiles import StaticFiles
+app.mount("/static", StaticFiles(directory=UPLOAD_DIR), name="static")
