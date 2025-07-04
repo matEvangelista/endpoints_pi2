@@ -423,7 +423,7 @@ def crud_apagar_usuario(session: Session, user_id: int) -> bool:
 # --- CRUD de Coleção ---
 def crud_criar_colecao(session: Session, user_id: str, colecao: ColecaoCreate) -> Dict[str, Any]:
     colecao_id = f"col_{user_id}_{re.sub(r'[^a-z0-9_]', '', colecao.nome.lower())}"
-    query = "MATCH (u:Usuario {id: $user_id}) MERGE (u)-[:CRIOU]->(c:Colecao {id: $colecao_id}) ON CREATE SET c.nome = $nome RETURN c.id as id, c.nome as nome, u.id as user_id"
+    query = "MATCH (u:Usuario {user_id: $user_id}) MERGE (u)-[:CRIOU]->(c:Colecao {id: $colecao_id}) ON CREATE SET c.nome = $nome RETURN c.id as id, c.nome as nome, u.id as user_id"
     result = session.run(query, user_id=user_id, colecao_id=colecao_id, nome=colecao.nome)
     return result.single().data()
 
@@ -452,7 +452,7 @@ def crud_remover_livro_colecao(session: Session, colecao_id: str, livro_id: int)
 
 def crud_gerenciar_interacao(session: Session, user_id: str, livro_id: int, interacao: InteracaoCreate) -> Optional[Dict[str, Any]]:
     query = """
-        MATCH (u:Usuario {id: $user_id}) MATCH (l:Livro {id: $livro_id})
+        MATCH (u:Usuario {user_id: $user_id}) MATCH (l:Livro {id: $livro_id})
         MERGE (u)-[r:INTERAGIU_COM]->(l)
         ON CREATE SET r.id=randomUUID(), r.status=$status, r.comentarios = CASE WHEN $novo_comentario IS NOT NULL THEN [$novo_comentario] ELSE [] END
         ON MATCH SET r.status=$status, r.comentarios = CASE WHEN $novo_comentario IS NOT NULL THEN r.comentarios + [$novo_comentario] ELSE r.comentarios END
@@ -464,36 +464,39 @@ def crud_gerenciar_interacao(session: Session, user_id: str, livro_id: int, inte
     return record.data() if record else None
 
 def crud_ler_interacao(session: Session, user_id: str, livro_id: int) -> Optional[Dict[str, Any]]:
-    query = "MATCH (:Usuario {id: $user_id})-[r:INTERAGIU_COM]->(:Livro {id: $livro_id}) RETURN r.id as id, r.status as status, r.comentarios as comentarios"
+    query = "MATCH (:Usuario {user_id: $user_id})-[r:INTERAGIU_COM]->(:Livro {id: $livro_id}) RETURN r.id as id, r.status as status, r.comentarios as comentarios"
     result = session.run(query, user_id=user_id, livro_id=livro_id)
     record = result.single()
     return record.data() if record else None
 
 def crud_apagar_interacao(session: Session, user_id: str, livro_id: int) -> bool:
-    query = "MATCH (:Usuario {id: $user_id})-[r:INTERAGIU_COM]->(:Livro {id: $livro_id}) DELETE r"
+    query = "MATCH (:Usuario {user_id: $user_id})-[r:INTERAGIU_COM]->(:Livro {id: $livro_id}) DELETE r"
     result = session.run(query, user_id=user_id, livro_id=livro_id)
     return result.consume().counters.relationships_deleted > 0
 
-def crud_avaliar_livro(session: Session, user_id: str, livro_id: int, avaliacao: AvaliacaoCreate) -> bool:
-    query = "MATCH (u:Usuario {id: $user_id}) MATCH (l:Livro {id: $livro_id}) MERGE (u)-[r:AVALIOU]->(l) SET r.nota = $nota"
+def crud_avaliar_livro(session: Session, user_id: int, livro_id: int, avaliacao: AvaliacaoCreate) -> bool:
+    query = """
+        MATCH (u:Usuario {user_id: $user_id}), (l:Livro {id: $livro_id}) MERGE (u)-[r:AVALIOU]->(l) SET r.nota = $nota
+    """
     result = session.run(query, user_id=user_id, livro_id=livro_id, nota=avaliacao.nota)
-    return result.consume().counters.properties_set > 0
+    counters = result.consume().counters
+    return counters.relationships_created > 0 or counters.properties_set > 0
 
-def crud_ler_avaliacao(session: Session, user_id: str, livro_id: int) -> Optional[Dict[str, Any]]:
-    query = "MATCH (:Usuario {id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) RETURN r.nota as nota"
+def crud_ler_avaliacao(session: Session, user_id: int, livro_id: int) -> Optional[Dict[str, Any]]:
+    query = "MATCH (:Usuario {user_id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) RETURN r.nota as nota"
     result = session.run(query, user_id=user_id, livro_id=livro_id)
     record = result.single()
     return record.data() if record else None
 
 def crud_apagar_avaliacao(session: Session, user_id: str, livro_id: int) -> bool:
-    query = "MATCH (:Usuario {id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) DELETE r"
+    query = "MATCH (:Usuario {user_id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) DELETE r"
     result = session.run(query, user_id=user_id, livro_id=livro_id)
     return result.consume().counters.relationships_deleted > 0
 
 def crud_gerar_recomendacoes(session: Session, user_id: str) -> List[Dict[str, Any]]:
     # 1. Buscar todos os dados necessários do Neo4j de uma vez.
     query = """
-    MATCH (u:Usuario {id: $user_id})
+    MATCH (u:Usuario {user_id: $user_id})
     WITH u, [(u)-[:INTERAGIU_COM|:AVALIOU]->(b) | b.id] AS interacted_ids
     MATCH (u)-[a:AVALIOU]->(source_book:Livro)
     WHERE a.nota IN [4, 5] AND source_book.descr_embedding IS NOT NULL AND source_book.descricao <> "None"
@@ -781,12 +784,12 @@ def apagar_interacao_endpoint(user_id: str, livro_id: int, session: Session = De
         raise HTTPException(status_code=404, detail="Interação não encontrada")
 
 @app.post("/usuarios/{user_id}/livros/{livro_id}/avaliar", status_code=status.HTTP_204_NO_CONTENT, tags=["Interações"])
-def avaliar_livro_endpoint(user_id: str, livro_id: int, avaliacao: AvaliacaoCreate, session: Session = Depends(get_db_session)):
+def avaliar_livro_endpoint(user_id: int, livro_id: int, avaliacao: AvaliacaoCreate, session: Session = Depends(get_db_session)):
     if not crud_avaliar_livro(session, user_id, livro_id, avaliacao):
         raise HTTPException(status_code=404, detail="Usuário ou livro não encontrado para avaliar")
 
 @app.get("/usuarios/{user_id}/livros/{livro_id}/avaliacao", response_model=AvaliacaoResponse, tags=["Interações"])
-def ler_avaliacao_endpoint(user_id: str, livro_id: int, session: Session = Depends(get_db_session)):
+def ler_avaliacao_endpoint(user_id: int, livro_id: int, session: Session = Depends(get_db_session)):
     resultado = crud_ler_avaliacao(session, user_id, livro_id)
     if resultado is None: raise HTTPException(status_code=404, detail="Avaliação não encontrada")
     return resultado
@@ -856,6 +859,30 @@ def upload_imagem_livro(file: UploadFile = File(...)):
         buffer.write(file.file.read())
     url_publica = f"/static/{nome_arquivo}"
     return {"url_img": url_publica}
+
+@app.delete("/upload/imagem_livro/", tags=["Livros"])
+def delete_imagem_livro(url_img: str = Query(...)):
+    """
+    Deleta um arquivo de imagem do servidor.
+    """
+    try:
+        # Extract filename from URL
+        if url_img.startswith("/static/"):
+            filename = url_img.replace("/static/", "")
+        elif url_img.startswith("http://127.0.0.1:8000/static/"):
+            filename = url_img.replace("http://127.0.0.1:8000/static/", "")
+        else:
+            return JSONResponse(status_code=400, content={"erro": "URL de imagem inválida."})
+        
+        caminho_arquivo = os.path.join(UPLOAD_DIR, filename)
+        
+        if os.path.exists(caminho_arquivo):
+            os.remove(caminho_arquivo)
+            return {"mensagem": "Imagem deletada com sucesso."}
+        else:
+            return JSONResponse(status_code=404, content={"erro": "Arquivo não encontrado."})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"erro": f"Erro ao deletar imagem: {str(e)}"})
 
 from fastapi.staticfiles import StaticFiles
 app.mount("/static", StaticFiles(directory=UPLOAD_DIR), name="static")
