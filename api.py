@@ -160,7 +160,11 @@ class ColecaoCreate(BaseModel):
 
 class ColecaoResponse(ColecaoCreate):
     id: str
-    user_id: str
+    user_id: int
+    livros: List[Dict[str, Any]] = Field(default_factory=list)
+
+class ColecoesResponse(ColecaoCreate):
+    id: str
     livros: List[Dict[str, Any]] = Field(default_factory=list)
 
 # Schemas de Relacionamentos e Recomendações
@@ -196,7 +200,7 @@ class LoginRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    user_id: str
+    user_id: int
 
 
 # --- 4. FUNÇÕES CRUD (Lógica de Banco de Dados) ---
@@ -391,20 +395,20 @@ def crud_buscar_todos_livros(session: Session) -> List[Dict[str, Any]]:
 # --- CRUD de Usuário ---
 def crud_criar_usuario(session: Session, usuario: UsuarioCreate) -> Dict[str, Any]:
     # Busca o maior user_id atual e incrementa
-    result = session.run("OPTIONAL MATCH (u:Usuario) RETURN coalesce(max(u.user_id), 0) AS max_id")
+    result = session.run("OPTIONAL MATCH (u:Usuario) RETURN coalesce(max(u.id), 0) AS max_id")
     max_id = result.single()["max_id"]
     user_id = max_id + 1
     senha_hash = bcrypt.hashpw(usuario.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     query = """
-        CREATE (u:Usuario {user_id: $user_id, name: $name, surname: $surname, email: $email, password: $senha_hash})
-        RETURN u.user_id as user_id, u.name as name, u.surname as surname, u.email as email
+        CREATE (u:Usuario {id: $user_id, name: $name, surname: $surname, email: $email, password: $senha_hash})
+        RETURN u.id as user_id, u.name as name, u.surname as surname, u.email as email
     """
     params = {"user_id": user_id, "name": usuario.name, "surname": usuario.surname, "email": usuario.email, "senha_hash": senha_hash}
     result = session.run(query, params)
     return result.single().data()
 
 def crud_ler_usuario(session: Session, user_id: int) -> Optional[Dict[str, Any]]:
-    result = session.run("MATCH (u:Usuario {user_id: $user_id}) RETURN u.user_id as user_id, u.name as name, u.surname as surname, u.email as email", user_id=user_id)
+    result = session.run("MATCH (u:Usuario {id: $user_id}) RETURN u.id as user_id, u.name as name, u.surname as surname, u.email as email", user_id=user_id)
     return result.single().data() if result.peek() else None
 
 def crud_atualizar_usuario(session: Session, user_id: int, usuario_update: UsuarioUpdate) -> Optional[Dict[str, Any]]:
@@ -412,29 +416,49 @@ def crud_atualizar_usuario(session: Session, user_id: int, usuario_update: Usuar
     if not update_data: return crud_ler_usuario(session, user_id)
     if "password" in update_data:
         update_data["password"] = bcrypt.hashpw(update_data.pop("password").encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    query = "MATCH (u:Usuario {user_id: $user_id}) SET u += $updates RETURN u.user_id as user_id, u.name as name, u.surname as surname, u.email as email"
+    query = "MATCH (u:Usuario {id: $user_id}) SET u += $updates RETURN u.id as user_id, u.name as name, u.surname as surname, u.email as email"
     result = session.run(query, user_id=user_id, updates=update_data)
     return result.single().data() if result.peek() else None
 
 def crud_apagar_usuario(session: Session, user_id: int) -> bool:
-    result = session.run("MATCH (u:Usuario {user_id: $user_id}) DETACH DELETE u", user_id=user_id)
+    result = session.run("MATCH (u:Usuario {id: $user_id}) DETACH DELETE u", user_id=user_id)
     return result.consume().counters.nodes_deleted > 0
 
 # --- CRUD de Coleção ---
-def crud_criar_colecao(session: Session, user_id: str, colecao: ColecaoCreate) -> Dict[str, Any]:
+def crud_ler_colecoes_por_usuario(session: Session, user_id: int) -> List[Dict[str, Any]]:
+    query = """
+    MATCH (u:Usuario {id: $user_id})-[:CRIOU]->(c:Colecao)
+    OPTIONAL MATCH (c)-[:CONTEM]->(l:Livro)
+    RETURN c.id as id, c.nome as nome, u.id as user_id, collect({id: l.id, titulo: l.titulo}) as livros
+    """
+    result = session.run(query, user_id=user_id)
+    return [record.data() for record in result]
+
+def crud_criar_colecao(session: Session, user_id: int, colecao: ColecaoCreate) -> Dict[str, Any]:
     colecao_id = f"col_{user_id}_{re.sub(r'[^a-z0-9_]', '', colecao.nome.lower())}"
-    query = "MATCH (u:Usuario {user_id: $user_id}) MERGE (u)-[:CRIOU]->(c:Colecao {id: $colecao_id}) ON CREATE SET c.nome = $nome RETURN c.id as id, c.nome as nome, u.id as user_id"
+    query = "MATCH (u:Usuario {id: $user_id}) MERGE (u)-[:CRIOU]->(c:Colecao {id: $colecao_id}) ON CREATE SET c.nome = $nome RETURN c.id as id, c.nome as nome, u.id as user_id"
     result = session.run(query, user_id=user_id, colecao_id=colecao_id, nome=colecao.nome)
     return result.single().data()
 
-def crud_ler_colecao(session: Session, colecao_id: str) -> Optional[Dict[str, Any]]:
+def crud_pegar_colecoes(session: Session, user_id: int) -> List[Dict[str, Any]]:
     query = """
-    MATCH (c:Colecao {id: $id})<-[:CRIOU]-(u:Usuario)
+    MATCH (u:Usuario {id: $user_id})-[:CRIOU]->(c:Colecao)
     OPTIONAL MATCH (c)-[:CONTEM]->(l:Livro)
-    WITH c, u, CASE WHEN l IS NULL THEN [] ELSE collect({id: l.id, titulo: coalesce(l.titulo, "Título Desconhecido")}) END as livros
-    RETURN c.id as id, c.nome as nome, u.id as user_id, livros
+    RETURN c.id AS id, c.nome AS nome, collect({id: l.id, titulo: l.titulo}) AS livros
+"""
+    
+    result = session.run(query, user_id=user_id)
+    return result.data()
+
+
+def crud_ler_colecao(session: Session, colecao_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    query = """
+    MATCH (u:Usuario {id: $user_id})-[:CRIOU]->(c:Colecao {id: $id})
+    OPTIONAL MATCH (c)-[:CONTEM]->(l:Livro)
+    WITH c, u, collect(CASE WHEN l IS NULL THEN {} ELSE {id: l.id, titulo: coalesce(l.titulo, "Título Desconhecido")} END) AS livros
+    RETURN c.id AS id, c.nome AS nome, u.id AS user_id, livros
     """
-    result = session.run(query, id=colecao_id)
+    result = session.run(query, id=colecao_id, user_id=user_id)
     return result.single().data() if result.peek() else None
 
 def crud_apagar_colecao(session: Session, colecao_id: str) -> bool:
@@ -450,9 +474,9 @@ def crud_remover_livro_colecao(session: Session, colecao_id: str, livro_id: int)
     query = "MATCH (c:Colecao {id: $colecao_id})-[r:CONTEM]->(l:Livro {id: $livro_id}) DELETE r"
     return session.run(query, colecao_id=colecao_id, livro_id=livro_id).consume().counters.relationships_deleted > 0
 
-def crud_gerenciar_interacao(session: Session, user_id: str, livro_id: int, interacao: InteracaoCreate) -> Optional[Dict[str, Any]]:
+def crud_gerenciar_interacao(session: Session, user_id: int, livro_id: int, interacao: InteracaoCreate) -> Optional[Dict[str, Any]]:
     query = """
-        MATCH (u:Usuario {user_id: $user_id}) MATCH (l:Livro {id: $livro_id})
+        MATCH (u:Usuario {id: $user_id}) MATCH (l:Livro {id: $livro_id})
         MERGE (u)-[r:INTERAGIU_COM]->(l)
         ON CREATE SET r.id=randomUUID(), r.status=$status, r.comentarios = CASE WHEN $novo_comentario IS NOT NULL THEN [$novo_comentario] ELSE [] END
         ON MATCH SET r.status=$status, r.comentarios = CASE WHEN $novo_comentario IS NOT NULL THEN r.comentarios + [$novo_comentario] ELSE r.comentarios END
@@ -463,40 +487,66 @@ def crud_gerenciar_interacao(session: Session, user_id: str, livro_id: int, inte
     record = result.single()
     return record.data() if record else None
 
-def crud_ler_interacao(session: Session, user_id: str, livro_id: int) -> Optional[Dict[str, Any]]:
-    query = "MATCH (:Usuario {user_id: $user_id})-[r:INTERAGIU_COM]->(:Livro {id: $livro_id}) RETURN r.id as id, r.status as status, r.comentarios as comentarios"
+def crud_ler_interacao(session: Session, user_id: int, livro_id: int) -> Optional[Dict[str, Any]]:
+    query = "MATCH (:Usuario {id: $user_id})-[r:INTERAGIU_COM]->(:Livro {id: $livro_id}) RETURN r.id as id, r.status as status, r.comentarios as comentarios"
     result = session.run(query, user_id=user_id, livro_id=livro_id)
     record = result.single()
     return record.data() if record else None
 
-def crud_apagar_interacao(session: Session, user_id: str, livro_id: int) -> bool:
-    query = "MATCH (:Usuario {user_id: $user_id})-[r:INTERAGIU_COM]->(:Livro {id: $livro_id}) DELETE r"
+def crud_livros_por_status_interacao(session: Session, user_id: int, status: str) -> List[Dict[str, Any]]:
+    """
+    Busca todos os livros com os quais um usuário interagiu com um status específico (LIDO, LENDO, etc.).
+    """
+    query = """
+    MATCH (u:Usuario {id: $user_id})-[r:INTERAGIU_COM {status: $status}]->(l:Livro)
+    OPTIONAL MATCH (a:Autor)-[:ESCREVEU]->(l)
+    OPTIONAL MATCH (l)-[:PERTENCE_A]->(c:Categoria)
+    RETURN l.id as id,
+           coalesce(l.titulo, "") AS titulo,
+           l.ano_publicacao as ano_publicacao,
+           coalesce(l.url_img, "") as url_img,
+           coalesce(l.descricao, "") as descricao,
+           coalesce(a.nome, "Desconhecido") as autor,
+           collect(c.nome) as categorias
+    """
+    result = session.run(query, user_id=user_id, status=status)
+    livros = []
+    for record in result:
+        data = record.data()
+        # Garante que a url da imagem seja sempre uma string para evitar erros no Pydantic/Frontend
+        if not isinstance(data.get('url_img'), str):
+            data['url_img'] = ""
+        livros.append(data)
+    return livros
+
+def crud_apagar_interacao(session: Session, user_id: int, livro_id: int) -> bool:
+    query = "MATCH (:Usuario {id: $user_id})-[r:INTERAGIU_COM]->(:Livro {id: $livro_id}) DELETE r"
     result = session.run(query, user_id=user_id, livro_id=livro_id)
     return result.consume().counters.relationships_deleted > 0
 
 def crud_avaliar_livro(session: Session, user_id: int, livro_id: int, avaliacao: AvaliacaoCreate) -> bool:
     query = """
-        MATCH (u:Usuario {user_id: $user_id}), (l:Livro {id: $livro_id}) MERGE (u)-[r:AVALIOU]->(l) SET r.nota = $nota
+        MATCH (u:Usuario {id: $user_id}), (l:Livro {id: $livro_id}) MERGE (u)-[r:AVALIOU]->(l) SET r.nota = $nota
     """
     result = session.run(query, user_id=user_id, livro_id=livro_id, nota=avaliacao.nota)
     counters = result.consume().counters
     return counters.relationships_created > 0 or counters.properties_set > 0
 
 def crud_ler_avaliacao(session: Session, user_id: int, livro_id: int) -> Optional[Dict[str, Any]]:
-    query = "MATCH (:Usuario {user_id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) RETURN r.nota as nota"
+    query = "MATCH (:Usuario {id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) RETURN r.nota as nota"
     result = session.run(query, user_id=user_id, livro_id=livro_id)
     record = result.single()
     return record.data() if record else None
 
-def crud_apagar_avaliacao(session: Session, user_id: str, livro_id: int) -> bool:
-    query = "MATCH (:Usuario {user_id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) DELETE r"
+def crud_apagar_avaliacao(session: Session, user_id: int, livro_id: int) -> bool:
+    query = "MATCH (:Usuario {id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) DELETE r"
     result = session.run(query, user_id=user_id, livro_id=livro_id)
     return result.consume().counters.relationships_deleted > 0
 
-def crud_gerar_recomendacoes(session: Session, user_id: str) -> List[Dict[str, Any]]:
+def crud_gerar_recomendacoes(session: Session, user_id: int) -> List[Dict[str, Any]]:
     # 1. Buscar todos os dados necessários do Neo4j de uma vez.
     query = """
-    MATCH (u:Usuario {user_id: $user_id})
+    MATCH (u:Usuario {id: $user_id})
     WITH u, [(u)-[:INTERAGIU_COM|:AVALIOU]->(b) | b.id] AS interacted_ids
     MATCH (u)-[a:AVALIOU]->(source_book:Livro)
     WHERE a.nota IN [4, 5] AND source_book.descr_embedding IS NOT NULL AND source_book.descricao <> "None"
@@ -508,8 +558,10 @@ def crud_gerar_recomendacoes(session: Session, user_id: str) -> List[Dict[str, A
     """
     data = session.run(query, user_id=user_id).single()
 
-    if not data or not data['source_books']: return []
-    source_books = data['source_books']; candidate_books = data['candidate_books']
+    if not data or not data['source_books']: 
+        return []
+    source_books = data['source_books']
+    candidate_books = data['candidate_books']
     all_recommendations = []
 
     for source_book in source_books:
@@ -536,7 +588,7 @@ def crud_gerar_recomendacoes(session: Session, user_id: str) -> List[Dict[str, A
 
 def crud_associar_livro_usuario(session: Session, user_id: int, livro_id: int) -> bool:
     query = """
-        MATCH (u:Usuario {user_id: $user_id}), (l:Livro {id: $livro_id})
+        MATCH (u:Usuario {id: $user_id}), (l:Livro {id: $livro_id})
         MERGE (u)-[:REGISTROU]->(l)
     """
     result = session.run(query, user_id=user_id, livro_id=livro_id)
@@ -544,7 +596,84 @@ def crud_associar_livro_usuario(session: Session, user_id: int, livro_id: int) -
 
 def crud_livros_registrados_por_usuario(session: Session, user_id: int) -> List[Dict[str, Any]]:
     query = '''
-    MATCH (u:Usuario {user_id: $user_id})-[:REGISTROU]->(l:Livro)
+    MATCH (u:Usuario {id: $user_id})-[:REGISTROU]->(l:Livro)
+    OPTIONAL MATCH (a:Autor)-[:ESCREVEU]->(l)
+    OPTIONAL MATCH (l)-[:PERTENCE_A]->(c:Categoria)
+    RETURN l.id as id,
+           coalesce(l.titulo, "") AS titulo,
+           l.ano_publicacao as ano_publicacao,
+           coalesce(l.url_img, "") as url_img,
+           coalesce(l.descricao, "") as descricao,
+           l.descr_embedding as descr_embedding,
+           coalesce(a.nome, "Desconhecido") as autor,
+           collect(c.nome) as categorias
+    '''
+    result = session.run(query, user_id=user_id)
+    livros = []
+    for record in result:
+        data = record.data()
+        if not isinstance(data.get('url_img'), str):
+            data['url_img'] = ""
+        livros.append(data)
+    return livros
+
+def crud_buscar_ultimos_livros_registrados_por_usuario(session: Session, user_id: int, limite: int) -> List[Dict[str, Any]]:
+    """
+    Busca os livros mais recentes registrados por um usuário, ordenados pela data de criação.
+    """
+    query = '''
+    MATCH (u:Usuario {id: $user_id})-[:REGISTROU]->(l:Livro)
+    OPTIONAL MATCH (a:Autor)-[:ESCREVEU]->(l)
+    OPTIONAL MATCH (l)-[:PERTENCE_A]->(c:Categoria)
+    // Retorna os dados necessários incluindo a data de criação para ordenação
+    RETURN l.id as id,
+           coalesce(l.titulo, "") AS titulo,
+           l.ano_publicacao as ano_publicacao,
+           coalesce(l.url_img, "") as url_img,
+           coalesce(l.descricao, "") as descricao,
+           l.descr_embedding as descr_embedding,
+           coalesce(a.nome, "Desconhecido") as autor,
+           collect(c.nome) as categorias,
+           l.data_criacao as data_criacao
+    // Ordena pela data de criação em ordem decrescente (mais novo primeiro)
+    ORDER BY data_criacao DESC
+    // Limita o número de resultados
+    LIMIT $limite
+    '''
+    result = session.run(query, user_id=user_id, limite=limite)
+    livros = []
+    for record in result:
+        data = record.data()
+        # Remove a chave de data_criacao pois não faz parte do LivroResponse
+        data.pop('data_criacao', None) 
+        if not isinstance(data.get('url_img'), str):
+            data['url_img'] = ""
+        livros.append(data)
+    return livros
+
+def crud_favoritar_livro(session: Session, user_id: int, livro_id: int) -> bool:
+    """Cria um relacionamento :FAVORITOU entre um usuário e um livro."""
+    query = """
+    MATCH (u:Usuario {id: $user_id}), (l:Livro {id: $livro_id})
+    MERGE (u)-[:FAVORITOU]->(l)
+    """
+    result = session.run(query, user_id=user_id, livro_id=livro_id)
+    return result.consume().counters.relationships_created > 0
+
+
+def crud_desfavoritar_livro(session: Session, user_id: int, livro_id: int) -> bool:
+    """Remove um relacionamento :FAVORITOU entre um usuário e um livro."""
+    query = """
+    MATCH (u:Usuario {id: $user_id})-[r:FAVORITOU]->(l:Livro {id: $livro_id})
+    DELETE r
+    """
+    result = session.run(query, user_id=user_id, livro_id=livro_id)
+    return result.consume().counters.relationships_deleted > 0
+
+def crud_listar_livros_favoritos(session: Session, user_id: int) -> List[Dict[str, Any]]:
+    """Lista todos os livros favoritados por um usuário."""
+    query = '''
+    MATCH (u:Usuario {id: $user_id})-[:FAVORITOU]->(l:Livro)
     OPTIONAL MATCH (a:Autor)-[:ESCREVEU]->(l)
     OPTIONAL MATCH (l)-[:PERTENCE_A]->(c:Categoria)
     RETURN l.id as id,
@@ -582,7 +711,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 def authenticate_user(session: Session, email: str, password: str) -> Optional[Dict[str, Any]]:
     # Find user by email
     result = session.run(
-        "MATCH (u:Usuario {email: $email}) RETURN u.user_id as user_id, u.name as name, u.surname as surname, u.email as email, u.password as password",
+        "MATCH (u:Usuario {email: $email}) RETURN u.id as user_id, u.name as name, u.surname as surname, u.email as email, u.password as password",
         email=email
     )
     record = result.single()
@@ -599,7 +728,7 @@ def authenticate_user(session: Session, email: str, password: str) -> Optional[D
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), session: Session = Depends(get_db_session)) -> Dict[str, Any]:
     try:
         payload = pyjwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
+        user_id: int = payload.get("sub")
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
     except pyjwt.PyJWTError:
@@ -687,9 +816,12 @@ def criar_livro_endpoint(user_id: int, livro: LivroCreate, session: Session = De
     db_livro_info = crud_criar_livro(session, livro, model)
     if not db_livro_info:
         raise HTTPException(status_code=500, detail="Não foi possível criar o livro.")
+    
     livro_id = db_livro_info['id']
-    if not crud_associar_livro_usuario(session, user_id, livro_id):
-        raise HTTPException(status_code=404, detail="Usuário não encontrado para associar o livro.")
+    
+    # Aqui associamos o livro recém-criado com o usuário que fez a requisição.
+    crud_associar_livro_usuario(session, user_id, livro_id)
+       
     return crud_ler_livro(session, livro_id)
 
 @app.get("/livros/{livro_id}", response_model=LivroResponse, tags=["Livros"])
@@ -739,14 +871,20 @@ def apagar_usuario_endpoint(user_id: int, session: Session = Depends(get_db_sess
     if not crud_apagar_usuario(session, user_id):
         raise HTTPException(status_code=404, detail="Usuário não encontrado")
 
+
 @app.post("/usuarios/{user_id}/colecoes/", response_model=ColecaoResponse, tags=["Coleções"])
-def criar_colecao_endpoint(user_id: str, colecao: ColecaoCreate, session: Session = Depends(get_db_session)):
+def criar_colecao_endpoint(user_id: int, colecao: ColecaoCreate, session: Session = Depends(get_db_session)):
     db_colecao = crud_criar_colecao(session, user_id, colecao)
-    return crud_ler_colecao(session, db_colecao['id'])
+    return crud_ler_colecao(session, db_colecao['id'], user_id)
+
+@app.get("/usuarios/{user_id}/colecoes/", response_model=List[ColecoesResponse], tags=["Coleções"])
+def pegar_colecoes_endpoint(user_id: int, session: Session = Depends(get_db_session)):
+    db_colecao = crud_pegar_colecoes(session, user_id)
+    return [ColecoesResponse(**colecao) for colecao in db_colecao]
 
 @app.get("/colecoes/{colecao_id}", response_model=ColecaoResponse, tags=["Coleções"])
-def ler_colecao_endpoint(colecao_id: str, session: Session = Depends(get_db_session)):
-    db_colecao = crud_ler_colecao(session, colecao_id)
+def ler_colecao_endpoint(user_id: int, colecao_id: str, session: Session = Depends(get_db_session)):
+    db_colecao = crud_ler_colecao(session, colecao_id, user_id)
     if not db_colecao: raise HTTPException(status_code=404, detail="Coleção não encontrada")
     return db_colecao
 
@@ -767,21 +905,53 @@ def remover_livro_da_colecao_endpoint(colecao_id: str, livro_id: int, session: S
 
 # --- Rotas de Interação e Recomendação ---
 @app.post("/usuarios/{user_id}/livros/{livro_id}/interacao", response_model=InteracaoResponse, tags=["Interações"])
-def gerenciar_interacao_endpoint(user_id: str, livro_id: int, interacao: InteracaoCreate, session: Session = Depends(get_db_session)):
+def gerenciar_interacao_endpoint(user_id: int, livro_id: int, interacao: InteracaoCreate, session: Session = Depends(get_db_session)):
     resultado = crud_gerenciar_interacao(session, user_id, livro_id, interacao)
     if resultado is None: raise HTTPException(status_code=404, detail="Usuário ou Livro não encontrado")
     return resultado
 
 @app.get("/usuarios/{user_id}/livros/{livro_id}/interacao", response_model=InteracaoResponse, tags=["Interações"])
-def ler_interacao_endpoint(user_id: str, livro_id: int, session: Session = Depends(get_db_session)):
+def ler_interacao_endpoint(user_id: int, livro_id: int, session: Session = Depends(get_db_session)):
     resultado = crud_ler_interacao(session, user_id, livro_id)
     if resultado is None: raise HTTPException(status_code=404, detail="Interação não encontrada")
     return resultado
 
 @app.delete("/usuarios/{user_id}/livros/{livro_id}/interacao", status_code=status.HTTP_204_NO_CONTENT, tags=["Interações"])
-def apagar_interacao_endpoint(user_id: str, livro_id: int, session: Session = Depends(get_db_session)):
+def apagar_interacao_endpoint(user_id: int, livro_id: int, session: Session = Depends(get_db_session)):
     if not crud_apagar_interacao(session, user_id, livro_id):
         raise HTTPException(status_code=404, detail="Interação não encontrada")
+    
+@app.get("/usuarios/{user_id}/livros/status/{status}", response_model=List[LivroResponse], tags=["Interações"])
+def listar_livros_por_status_endpoint(user_id: int, status: str, session: Session = Depends(get_db_session)):
+    """
+    Lista todos os livros de um usuário filtrados por um status de interação.
+    O status deve ser 'LIDO' ou 'LENDO'.
+    """
+    valid_statuses = ["LIDO", "LENDO", "NOVO"]
+    if status.upper() not in valid_statuses:
+        raise HTTPException(status_code=400, detail="Status inválido. Use 'LIDO' ou 'LENDO'.")
+    
+    livros = crud_livros_por_status_interacao(session, user_id, status.upper())
+    return livros
+
+@app.post("/usuarios/{user_id}/livros/{livro_id}/favoritar", status_code=status.HTTP_201_CREATED, tags=["Favoritos"])
+def favoritar_livro_endpoint(user_id: int, livro_id: int, session: Session = Depends(get_db_session)):
+    """Marca um livro como favorito para um usuário."""
+    crud_favoritar_livro(session, user_id, livro_id)
+
+    return {"message": "Livro marcado como favorito com sucesso."}
+
+@app.delete("/usuarios/{user_id}/livros/{livro_id}/favoritar", status_code=status.HTTP_204_NO_CONTENT, tags=["Favoritos"])
+def desfavoritar_livro_endpoint(user_id: int, livro_id: int, session: Session = Depends(get_db_session)):
+    """Remove um livro dos favoritos de um usuário."""
+    if not crud_desfavoritar_livro(session, user_id, livro_id):
+        raise HTTPException(status_code=404, detail="Relação de favorito não encontrada para ser removida.")
+
+@app.get("/usuarios/{user_id}/favoritos", response_model=List[LivroResponse], tags=["Favoritos"])
+def listar_favoritos_endpoint(user_id: int, session: Session = Depends(get_db_session)):
+    """Lista todos os livros favoritados por um usuário."""
+    livros_favoritos = crud_listar_livros_favoritos(session, user_id)
+    return livros_favoritos
 
 @app.post("/usuarios/{user_id}/livros/{livro_id}/avaliar", status_code=status.HTTP_204_NO_CONTENT, tags=["Interações"])
 def avaliar_livro_endpoint(user_id: int, livro_id: int, avaliacao: AvaliacaoCreate, session: Session = Depends(get_db_session)):
@@ -795,12 +965,12 @@ def ler_avaliacao_endpoint(user_id: int, livro_id: int, session: Session = Depen
     return resultado
 
 @app.delete("/usuarios/{user_id}/livros/{livro_id}/avaliacao", status_code=status.HTTP_204_NO_CONTENT, tags=["Interações"])
-def apagar_avaliacao_endpoint(user_id: str, livro_id: int, session: Session = Depends(get_db_session)):
+def apagar_avaliacao_endpoint(user_id: int, livro_id: int, session: Session = Depends(get_db_session)):
     if not crud_apagar_avaliacao(session, user_id, livro_id):
         raise HTTPException(status_code=404, detail="Avaliação não encontrada")
 
 @app.get("/usuarios/{user_id}/recomendacoes", response_model=RecomendacoesResponse, tags=["Recomendações"])
-def gerar_recomendacoes_endpoint(user_id: str, session: Session = Depends(get_db_session)):
+def gerar_recomendacoes_endpoint(user_id: int, session: Session = Depends(get_db_session)):
     recomendacoes = crud_gerar_recomendacoes(session, user_id)
     return {"recomendacoes": recomendacoes}
 
@@ -809,10 +979,22 @@ def listar_livros_registrados_endpoint(user_id: int, session: Session = Depends(
     livros = crud_livros_registrados_por_usuario(session, user_id)
     return livros
 
+@app.get("/usuarios/{user_id}/livros/recentes", response_model=List[LivroResponse], tags=["Livros"])
+def listar_ultimos_livros_registrados_endpoint(
+    user_id: int, 
+    limite: int = Query(5, ge=1, le=20, description="Número de livros recentes a serem retornados."),
+    session: Session = Depends(get_db_session)
+):
+    """
+    Obtém uma lista dos livros mais recentemente cadastrados por um usuário específico.
+    """
+    livros = crud_buscar_ultimos_livros_registrados_por_usuario(session, user_id, limite)
+    return livros
+
 @app.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED, tags=["Authentication"])
 def registar_usuario_endpoint(usuario: UsuarioCreate, session: Session = Depends(get_db_session)):
     # Verifica se o usuário já existe
-    result = session.run("MATCH (u:Usuario {email: $email}) RETURN u.user_id", email=usuario.email)
+    result = session.run("MATCH (u:Usuario {email: $email}) RETURN u.id", email=usuario.email)
     if result.single():
         raise HTTPException(status_code=400, detail="Email already registered")
     
