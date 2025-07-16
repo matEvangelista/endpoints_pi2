@@ -545,6 +545,8 @@ def crud_apagar_avaliacao(session: Session, user_id: int, livro_id: int) -> bool
 
 def crud_gerar_recomendacoes(session: Session, user_id: int) -> List[Dict[str, Any]]:
     # 1. Buscar todos os dados necessários do Neo4j de uma vez.
+    user_id = int(user_id)
+    
     query = """
     MATCH (u:Usuario {id: $user_id})
     WITH u, [(u)-[:INTERAGIU_COM|:AVALIOU]->(b) | b.id] AS interacted_ids
@@ -556,8 +558,10 @@ def crud_gerar_recomendacoes(session: Session, user_id: int) -> List[Dict[str, A
     WITH source_books, collect({id: candidate_book.id, titulo: candidate_book.titulo, embedding: candidate_book.descr_embedding}) AS candidate_books
     RETURN source_books, candidate_books
     """
-    data = session.run(query, user_id=user_id).single()
-
+    
+    result = session.run(query, user_id=user_id)
+    data = result.single()
+    
     if not data or not data['source_books']: 
         return []
     source_books = data['source_books']
