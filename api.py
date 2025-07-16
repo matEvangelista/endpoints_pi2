@@ -562,7 +562,7 @@ def crud_avaliar_livro(session: Session, user_id: int, livro_id: int, avaliacao:
     return counters.relationships_created > 0 or counters.properties_set > 0
 
 def crud_ler_avaliacao(session: Session, user_id: int, livro_id: int) -> Optional[Dict[str, Any]]:
-    query = "MATCH (:Usuario {user_id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) RETURN r.nota as nota"
+    query = "MATCH (:Usuario {id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) RETURN r.nota as nota"
     result = session.run(query, user_id=user_id, livro_id=livro_id)
     record = result.single()
     return record.data() if record else None
@@ -574,6 +574,8 @@ def crud_apagar_avaliacao(session: Session, user_id: int, livro_id: int) -> bool
 
 def crud_gerar_recomendacoes(session: Session, user_id: int) -> List[Dict[str, Any]]:
     # 1. Buscar todos os dados necessários do Neo4j de uma vez.
+    user_id = int(user_id)
+    
     query = """
     MATCH (u:Usuario {id: $user_id})
     WITH u, [(u)-[:INTERAGIU_COM|:AVALIOU]->(b) | b.id] AS interacted_ids
@@ -585,10 +587,14 @@ def crud_gerar_recomendacoes(session: Session, user_id: int) -> List[Dict[str, A
     WITH source_books, collect({id: candidate_book.id, titulo: candidate_book.titulo, embedding: candidate_book.descr_embedding}) AS candidate_books
     RETURN source_books, candidate_books
     """
-    data = session.run(query, user_id=user_id).single()
-
-    if not data or not data['source_books']: return []
-    source_books = data['source_books']; candidate_books = data['candidate_books']
+    
+    result = session.run(query, user_id=user_id)
+    data = result.single()
+    
+    if not data or not data['source_books']: 
+        return []
+    source_books = data['source_books']
+    candidate_books = data['candidate_books']
     all_recommendations = []
 
     for source_book in source_books:
