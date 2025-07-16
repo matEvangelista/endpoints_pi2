@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 
 # --- 2. CONFIGURAÇÃO DO BANCO DE DADOS E MODELO DE ML ---
 NEO4J_URI = "neo4j://localhost:7687"
-NEO4J_AUTH = ("neo4j", "12345678") # Senha que você forneceu
+NEO4J_AUTH = ("neo4j", "senha123456789") # Senha que você forneceu
 
 SECRET_KEY = "your-secret-key-here-change-this-in-production"
 ALGORITHM = "HS256"
@@ -471,7 +471,15 @@ def crud_ler_colecao(session: Session, colecao_id: str, user_id: str) -> Optiona
     query = """
     MATCH (u:Usuario {id: $user_id})-[:CRIOU]->(c:Colecao {id: $id})
     OPTIONAL MATCH (c)-[:CONTEM]->(l:Livro)
-    WITH c, u, collect(CASE WHEN l IS NULL THEN {} ELSE {id: l.id, titulo: coalesce(l.titulo, "Título Desconhecido")} END) AS livros
+    OPTIONAL MATCH (a:Autor)-[:ESCREVEU]->(l)
+    WITH c, u, collect(CASE WHEN l IS NULL THEN {} ELSE {
+        id: l.id, 
+        titulo: coalesce(l.titulo, "Título Desconhecido"),
+        url_img: coalesce(l.url_img, ""),
+        descricao: coalesce(l.descricao, ""),
+        ano_publicacao: l.ano_publicacao,
+        autor: coalesce(a.nome, "Autor Desconhecido")
+    } END) AS livros
     RETURN c.id AS id, c.nome AS nome, u.id AS user_id, livros
     """
     result = session.run(query, id=colecao_id, user_id=user_id)
