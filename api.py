@@ -19,7 +19,7 @@ from neo4j import GraphDatabase, Driver, Session
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 import jwt as pyjwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 import os
@@ -166,6 +166,27 @@ class ColecaoResponse(ColecaoCreate):
 class ColecoesResponse(ColecaoCreate):
     id: str
     livros: List[Dict[str, Any]] = Field(default_factory=list)
+
+class ColecaoUpdate(BaseModel): # Schema adicionado
+    nome: Optional[str] = None
+    emoji: Optional[str] = None
+
+# Schemas de Comentários
+class ComentarioBase(BaseModel):
+    texto: str = Field(..., example="Um livro transformador!")
+
+class ComentarioCreate(ComentarioBase):
+    pass
+
+class ComentarioUpdate(ComentarioBase):
+    pass
+
+class ComentarioResponse(ComentarioBase):
+    id: str
+    user_id: int
+    user_name: str
+    livro_id: int
+    data_criacao: datetime
 
 # Schemas de Relacionamentos e Recomendações
 class InteracaoCreate(BaseModel):
@@ -441,12 +462,7 @@ def crud_criar_colecao(session: Session, user_id: int, colecao: ColecaoCreate) -
     return result.single().data()
 
 def crud_pegar_colecoes(session: Session, user_id: int) -> List[Dict[str, Any]]:
-    query = """
-    MATCH (u:Usuario {id: $user_id})-[:CRIOU]->(c:Colecao)
-    OPTIONAL MATCH (c)-[:CONTEM]->(l:Livro)
-    RETURN c.id AS id, c.nome AS nome, collect({id: l.id, titulo: l.titulo}) AS livros
-"""
-    
+    query = "MATCH (u:Usuario {id: $user_id})-[:CRIOU]->(c:Colecao) RETURN c.id AS id, c.nome AS nome"
     result = session.run(query, user_id=user_id)
     return result.data()
 
@@ -464,6 +480,19 @@ def crud_ler_colecao(session: Session, colecao_id: str, user_id: str) -> Optiona
 def crud_apagar_colecao(session: Session, colecao_id: str) -> bool:
     result = session.run("MATCH (c:Colecao {id: $id}) DETACH DELETE c", id=colecao_id)
     return result.consume().counters.nodes_deleted > 0
+
+def crud_atualizar_colecao(session: Session, colecao_id: str, colecao_update: ColecaoUpdate) -> Optional[Dict[str, Any]]:
+    update_data = colecao_update.dict(exclude_unset=True)
+    if not update_data:
+        return crud_ler_colecao(session, colecao_id)
+
+    query = """
+        MATCH (c:Colecao {id: $id})
+        SET c += $updates
+        RETURN c.id as id, c.nome as nome, c.emoji as emoji
+    """
+    result = session.run(query, id=colecao_id, updates=update_data)
+    return result.single().data() if result.peek() else None
 
 # --- CRUD de Relacionamentos ---
 def crud_adicionar_livro_colecao(session: Session, colecao_id: str, livro_id: int) -> bool:
@@ -539,7 +568,7 @@ def crud_ler_avaliacao(session: Session, user_id: int, livro_id: int) -> Optiona
     return record.data() if record else None
 
 def crud_apagar_avaliacao(session: Session, user_id: int, livro_id: int) -> bool:
-    query = "MATCH (:Usuario {id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) DELETE r"
+    query = "MATCH (:Usuario {user_id: $user_id})-[r:AVALIOU]->(:Livro {id: $livro_id}) DELETE r"
     result = session.run(query, user_id=user_id, livro_id=livro_id)
     return result.consume().counters.relationships_deleted > 0
 
@@ -698,13 +727,74 @@ def crud_listar_livros_favoritos(session: Session, user_id: int) -> List[Dict[st
         livros.append(data)
     return livros
 
+# CRUD PARA COMENTÁRIOS
+def crud_criar_comentario(session: Session, user_id: int, livro_id: int, comentario: ComentarioCreate) -> Dict[str, Any]:
+    """Cria um novo comentário de um usuário para um livro."""
+    query = """
+    MATCH (u:Usuario {id: $user_id}), (l:Livro {id: $livro_id})
+    CREATE (u)-[r:COMENTOU {
+        id: randomUUID(),
+        texto: $texto,
+        data_criacao: datetime()
+    }]->(l)
+    RETURN r.id as id, r.texto as texto, r.data_criacao as data_criacao, u.id as user_id, u.name as user_name, l.id as livro_id
+    """
+    params = {"user_id": user_id, "livro_id": livro_id, "texto": comentario.texto}
+    result = session.run(query, params)
+    record = result.single()
+    if not record:
+        return None
+    data = record.data()
+    if data.get('data_criacao') and hasattr(data['data_criacao'], 'to_native'):
+        data['data_criacao'] = data['data_criacao'].to_native()
+    return data
+
+def crud_ler_comentarios_de_um_livro(session: Session, livro_id: int) -> List[Dict[str, Any]]:
+    """Lê todos os comentários de um livro específico."""
+    query = """
+    MATCH (u:Usuario)-[r:COMENTOU]->(l:Livro {id: $livro_id})
+    RETURN r.id as id, r.texto as texto, r.data_criacao as data_criacao, u.id as user_id, u.name as user_name, l.id as livro_id
+    ORDER BY r.data_criacao DESC
+    """
+    result = session.run(query, livro_id=livro_id)
+    comentarios = []
+    for record in result:
+        data = record.data()
+        if data.get('data_criacao') and hasattr(data['data_criacao'], 'to_native'):
+            data['data_criacao'] = data['data_criacao'].to_native()
+        comentarios.append(data)
+    return comentarios
+
+def crud_atualizar_comentario(session: Session, user_id: int, comentario_id: str, comentario_update: ComentarioUpdate) -> Optional[Dict[str, Any]]:
+    """Atualiza um comentário, verificando se o usuário é o dono."""
+    query = """
+    MATCH (u:Usuario {id: $user_id})-[r:COMENTOU {id: $comentario_id}]->(l:Livro)
+    SET r.texto = $texto
+    RETURN r.id as id, r.texto as texto, r.data_criacao as data_criacao, u.id as user_id, u.name as user_name, l.id as livro_id
+    """
+    params = {"user_id": user_id, "comentario_id": comentario_id, "texto": comentario_update.texto}
+    result = session.run(query, params)
+    record = result.single()
+    if not record:
+        return None
+    data = record.data()
+    if data.get('data_criacao') and hasattr(data['data_criacao'], 'to_native'):
+        data['data_criacao'] = data['data_criacao'].to_native()
+    return data
+
+def crud_apagar_comentario(session: Session, user_id: int, comentario_id: str) -> bool:
+    """Apaga um comentário, verificando se o usuário é o dono."""
+    query = "MATCH (u:Usuario {id: $user_id})-[r:COMENTOU {id: $comentario_id}]->() DELETE r"
+    result = session.run(query, user_id=user_id, comentario_id=comentario_id)
+    return result.consume().counters.relationships_deleted > 0
+
 # Autenticaão
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
     to_encode.update({"exp": expire})
     encoded_jwt = pyjwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -896,6 +986,18 @@ def ler_colecao_endpoint(user_id: int, colecao_id: str, session: Session = Depen
 def apagar_colecao_endpoint(colecao_id: str, session: Session = Depends(get_db_session)):
     if not crud_apagar_colecao(session, colecao_id):
         raise HTTPException(status_code=404, detail="Coleção não encontrada")
+    
+@app.put("/colecoes/{colecao_id}", response_model=ColecaoResponse, tags=["Coleções"])
+def atualizar_colecao_endpoint(colecao_id: str, colecao: ColecaoUpdate, session: Session = Depends(get_db_session)):
+    db_colecao = crud_atualizar_colecao(session, colecao_id, colecao)
+    if not db_colecao:
+        raise HTTPException(status_code=404, detail="Coleção não encontrada para atualizar")
+    result = session.run("MATCH (u:Usuario)-[:CRIOU]->(c:Colecao {id: $id}) RETURN u.id as user_id", id=colecao_id)
+    owner = result.single()
+    if not owner:
+        raise HTTPException(status_code=404, detail="Dono da coleção não encontrado")
+    
+    return crud_ler_colecao(session, colecao_id, owner['user_id'])
 
 @app.post("/colecoes/{colecao_id}/livros/{livro_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Coleções"])
 def adicionar_livro_a_colecao_endpoint(colecao_id: str, livro_id: int, session: Session = Depends(get_db_session)):
@@ -993,7 +1095,45 @@ def listar_ultimos_livros_registrados_endpoint(
     Obtém uma lista dos livros mais recentemente cadastrados por um usuário específico.
     """
     livros = crud_buscar_ultimos_livros_registrados_por_usuario(session, user_id, limite)
+    if not livros:
+        raise HTTPException(status_code=404, detail="Nenhum livro registrado encontrado para este usuário.")
     return livros
+
+# ROTAS PARA COMENTÁRIOS
+@app.post("/usuarios/{user_id}/livros/{livro_id}/comentarios", response_model=ComentarioResponse, status_code=status.HTTP_201_CREATED, tags=["Comentários"])
+def criar_comentario_endpoint(user_id: int, livro_id: int, comentario: ComentarioCreate, session: Session = Depends(get_db_session)):
+    """Cria um novo comentário de um usuário para um livro."""
+
+    novo_comentario = crud_criar_comentario(session, user_id, livro_id, comentario)
+    if not novo_comentario:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Não foi possível adicionar o comentário. Verifique se o usuário e o livro existem."
+        )
+    return novo_comentario
+
+@app.get("/livros/{livro_id}/comentarios", response_model=List[ComentarioResponse], tags=["Comentários"])
+def ler_comentarios_endpoint(livro_id: int, session: Session = Depends(get_db_session)):
+    """Lê todos os comentários de um livro específico."""
+    return crud_ler_comentarios_de_um_livro(session, livro_id)
+
+@app.put("/usuarios/{user_id}/comentarios/{comentario_id}", response_model=ComentarioResponse, tags=["Comentários"])
+def atualizar_comentario_endpoint(user_id: int, comentario_id: str, comentario: ComentarioUpdate, session: Session = Depends(get_db_session)):
+    """Atualiza um comentário existente. O usuário deve ser o autor do comentário."""
+
+    comentario_atualizado = crud_atualizar_comentario(session, user_id, comentario_id, comentario)
+    if not comentario_atualizado:
+        raise HTTPException(status_code=404, detail="Comentário não encontrado ou você não tem permissão para editá-lo.")
+    return comentario_atualizado
+
+@app.delete("/usuarios/{user_id}/comentarios/{comentario_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Comentários"])
+def apagar_comentario_endpoint(user_id: int, comentario_id: str, session: Session = Depends(get_db_session)):
+    """Apaga um comentário. O usuário deve ser o autor do comentário."""
+
+    if not crud_apagar_comentario(session, user_id, comentario_id):
+        raise HTTPException(status_code=404, detail="Comentário não encontrado ou você não tem permissão para apagá-lo.")
+
+
 
 @app.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED, tags=["Authentication"])
 def registar_usuario_endpoint(usuario: UsuarioCreate, session: Session = Depends(get_db_session)):
@@ -1022,7 +1162,7 @@ def login_endpoint(login_data: LoginRequest, session: Session = Depends(get_db_s
     
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user["user_id"]}, expires_delta=access_token_expires
+        data={"sub": str(user["user_id"])}, expires_delta=access_token_expires
     )
     
     return TokenResponse(access_token=access_token, user_id=str(user["user_id"]))
@@ -1039,7 +1179,7 @@ def upload_imagem_livro(file: UploadFile = File(...)):
     extensao = os.path.splitext(file.filename)[1]
     if extensao.lower() not in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
         return JSONResponse(status_code=400, content={"erro": "Formato de imagem não suportado."})
-    nome_arquivo = f"livro_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}{extensao}"
+    nome_arquivo = f"livro_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}{extensao}"
     caminho_arquivo = os.path.join(UPLOAD_DIR, nome_arquivo)
     with open(caminho_arquivo, "wb") as buffer:
         buffer.write(file.file.read())
